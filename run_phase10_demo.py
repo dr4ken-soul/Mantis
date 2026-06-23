@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import detection.crime_pump_detector as detector_module
 from core.backtester import BacktestEngine
 from core.data_pipeline import DataPipeline
 from core.signal_aggregator import SignalAggregator
@@ -34,6 +35,25 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BACKTEST_SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
 SCAN_SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+
+
+async def _skip_backtest_persistence(*args, **kwargs) -> int:
+    """Skip per-candle detector writes during backtests."""
+    return 0
+
+
+async def persist_with_retries(label: str, func, *args, attempts: int = 3, **kwargs):
+    """Persist a row without letting transient database issues kill the report."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as error:
+            last_error = error
+            print(f"  {label} save failed ({attempt}/{attempts}): {error}")
+            if attempt < attempts:
+                await asyncio.sleep(2 * attempt)
+    return {"error": str(last_error)}
 
 
 def stage_to_number(stage: CrimeStage | str | None) -> int:
@@ -153,7 +173,15 @@ async def run_backtests(backtester: BacktestEngine) -> list[dict]:
             "profit_factor": result.profit_factor,
             "data_source": result.data_source or "unknown",
         }
-        row["db_id"] = await save_backtest_result(row)
+        db_result = await persist_with_retries(
+            f"{symbol} backtest_result",
+            save_backtest_result,
+            row,
+        )
+        if isinstance(db_result, dict) and "error" in db_result:
+            row["db_error"] = db_result["error"]
+        else:
+            row["db_id"] = db_result
         results.append(row)
     return results
 
@@ -182,15 +210,24 @@ async def run_live_scans(data_pipeline: DataPipeline, detector: CrimePumpDetecto
         )
 
         current_stage = stage_to_number(alert.crime_stage)
-        await upsert_dashboard_token(
+        token_save = await persist_with_retries(
+            f"{alert.token_symbol} dashboard_token",
+            upsert_dashboard_token,
             alert.token_symbol,
             current_stage=current_stage,
             stage_confidence=alert.stage_confidence,
         )
-        await save_detection_results(
+        if isinstance(token_save, dict) and "error" in token_save:
+            print(f"  dashboard token save skipped: {token_save['error']}")
+
+        detection_save = await persist_with_retries(
+            f"{alert.token_symbol} detection_results",
+            save_detection_results,
             alert.token_symbol,
             [layer_to_dict(layer) for layer in alert.layer_results],
         )
+        if isinstance(detection_save, dict) and "error" in detection_save:
+            print(f"  detection result save skipped: {detection_save['error']}")
 
         source_summary = skill_source_summary(token)
         rows.append({
@@ -272,7 +309,9 @@ def write_report(backtests: list[dict], scans: list[dict]) -> Path:
 async def main() -> None:
     """Run Phase 10 end to end."""
     setup_logging("INFO")
-    await init_db()
+    db_init = await persist_with_retries("database_init", init_db, attempts=2)
+    if isinstance(db_init, dict) and "error" in db_init:
+        print(f"database init failed, continuing with report-only mode: {db_init['error']}")
 
     detector = CrimePumpDetector()
     data_pipeline = DataPipeline()
@@ -282,10 +321,20 @@ async def main() -> None:
     )
 
     try:
+        original_alert_save = detector_module.save_crime_pump_alert
+        original_scan_save = detector_module.save_scan_result
+        detector_module.save_crime_pump_alert = _skip_backtest_persistence
+        detector_module.save_scan_result = _skip_backtest_persistence
         backtests = await run_backtests(backtester)
+        detector_module.save_crime_pump_alert = original_alert_save
+        detector_module.save_scan_result = original_scan_save
         scans = await run_live_scans(data_pipeline, detector)
         report = write_report(backtests, scans)
     finally:
+        if detector_module.save_crime_pump_alert is _skip_backtest_persistence:
+            detector_module.save_crime_pump_alert = original_alert_save
+        if detector_module.save_scan_result is _skip_backtest_persistence:
+            detector_module.save_scan_result = original_scan_save
         await backtester.close()
         await data_pipeline.close()
 
